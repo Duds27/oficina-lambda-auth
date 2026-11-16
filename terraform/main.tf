@@ -4,21 +4,12 @@ locals {
 
 # ───────────── Estado remoto dos demais repositórios de infra ─────────────
 # Repo 2 (infra-k8s): VPC, subnets privadas, SG dos nós e o NLB interno do app.
+# A Lambda não depende mais do infra-database: o cliente vem do os-service, por HTTP.
 data "terraform_remote_state" "k8s" {
   backend = "s3"
   config = {
     bucket = var.state_bucket
     key    = "infra-k8s/${var.environment}/terraform.tfstate"
-    region = var.aws_region
-  }
-}
-
-# Repo 3 (infra-database): endpoint do RDS e ARN do secret de credenciais.
-data "terraform_remote_state" "database" {
-  backend = "s3"
-  config = {
-    bucket = var.state_bucket
-    key    = "infra-database/${var.environment}/terraform.tfstate"
     region = var.aws_region
   }
 }
@@ -39,21 +30,26 @@ resource "aws_iam_role" "lambda" {
   assume_role_policy = data.aws_iam_policy_document.assume.json
 }
 
-# Execução básica + ENI na VPC (necessário para acessar o RDS em subnet privada).
+# Execução básica + ENI na VPC (necessário para alcançar o NLB interno do os-service).
 resource "aws_iam_role_policy_attachment" "vpc" {
   role       = aws_iam_role.lambda.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
 }
 
-# Resolve o ARN completo do secret do JWT a partir do nome/ID (IAM exige ARN em Resource).
+# Resolve o ARN completo dos secrets a partir do nome/ID (IAM exige ARN em Resource).
 data "aws_secretsmanager_secret" "jwt" {
   name = var.jwt_secret_id
 }
 
+data "aws_secretsmanager_secret" "internal_key" {
+  name = var.internal_key_secret_id
+}
+
+# Só a chave do JWT e a chave interna do os-service. Nenhuma credencial de banco.
 data "aws_iam_policy_document" "secrets" {
   statement {
     actions   = ["secretsmanager:GetSecretValue"]
-    resources = [data.aws_secretsmanager_secret.jwt.arn, data.terraform_remote_state.database.outputs.db_secret_arn]
+    resources = [data.aws_secretsmanager_secret.jwt.arn, data.aws_secretsmanager_secret.internal_key.arn]
   }
 }
 
@@ -69,10 +65,22 @@ resource "aws_security_group" "lambda" {
   description = "SG da Lambda de autenticacao"
   vpc_id      = data.terraform_remote_state.k8s.outputs.vpc_id
 
+  # Saída restrita ao que a função usa. Sem regra para a porta 3306: a Lambda não fala
+  # mais com o RDS. A regra de entrada do RDS (CIDR da VPC) fica no infra-database e
+  # continua lá, porque também atende os nós do EKS.
   egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
+    description = "os-service pelo NLB interno"
+    from_port   = var.os_service_port
+    to_port     = var.os_service_port
+    protocol    = "tcp"
+    cidr_blocks = [data.terraform_remote_state.k8s.outputs.vpc_cidr]
+  }
+
+  egress {
+    description = "Secrets Manager (HTTPS)"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
 }
@@ -95,11 +103,13 @@ resource "aws_lambda_function" "auth" {
 
   environment {
     variables = {
-      JWT_SECRET_ID       = var.jwt_secret_id
-      DB_SECRET_ID        = data.terraform_remote_state.database.outputs.db_secret_arn
-      JWT_ISSUER          = var.jwt_issuer
-      JWT_AUDIENCE        = var.jwt_audience
-      JWT_EXPIRES_MINUTES = tostring(var.jwt_expires_minutes)
+      JWT_SECRET_ID          = var.jwt_secret_id
+      JWT_ISSUER             = var.jwt_issuer
+      JWT_AUDIENCE           = var.jwt_audience
+      JWT_EXPIRES_MINUTES    = tostring(var.jwt_expires_minutes)
+      OS_SERVICE_URL         = var.os_service_url
+      OS_SERVICE_TIMEOUT_MS  = tostring(var.os_service_timeout_ms)
+      INTERNAL_KEY_SECRET_ID = var.internal_key_secret_id
     }
   }
 }
@@ -117,7 +127,6 @@ resource "aws_lambda_function" "authorizer" {
   environment {
     variables = {
       JWT_SECRET_ID = var.jwt_secret_id
-      DB_SECRET_ID  = data.terraform_remote_state.database.outputs.db_secret_arn
       JWT_ISSUER    = var.jwt_issuer
       JWT_AUDIENCE  = var.jwt_audience
     }

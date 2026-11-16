@@ -2,7 +2,7 @@ import type {
   APIGatewayRequestAuthorizerEventV2,
   APIGatewaySimpleAuthorizerWithContextResult,
 } from "aws-lambda";
-import { getConfig } from "./config.js";
+import { getJwtConfig } from "./config.js";
 import { verifyToken } from "./jwt.js";
 
 /**
@@ -33,14 +33,15 @@ export const handler = async (
       : header.trim();
     if (!token) return denied;
 
-    const cfg = await getConfig();
-    const payload = verifyToken(cfg, token);
+    const cfg = await getJwtConfig();
+    const payload = verifyToken(cfg, token) as Record<string, unknown>;
 
     return {
       isAuthorized: true,
       context: {
-        clienteId: String(payload.sub ?? ""),
-        cpf: String((payload as Record<string, unknown>).cpf ?? ""),
+        // Tokens emitidos antes do claim `clienteId` só têm o `sub`, com o mesmo valor.
+        clienteId: String(payload.clienteId ?? payload.sub ?? ""),
+        cpf: String(payload.cpf ?? ""),
       },
     };
   } catch {
