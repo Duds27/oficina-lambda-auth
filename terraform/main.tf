@@ -1,9 +1,44 @@
 locals {
   name = "${var.project}-${var.environment}"
+  k8s  = data.terraform_remote_state.k8s.outputs
+
+  # Recurso → serviço. Os caminhos já são exclusivos de cada serviço, então o API Gateway
+  # repassa o path como veio, sem reescrita. /internal/* e /dev/* ficam de fora de propósito.
+  recursos = {
+    "/api/clientes"       = "os"
+    "/api/veiculos"       = "os"
+    "/api/pecas"          = "os"
+    "/api/servicos"       = "os"
+    "/api/ordens-servico" = "os"
+    "/api/orcamentos"     = "billing"
+    "/api/pagamentos"     = "billing"
+    "/api/execucoes"      = "execution"
+  }
+
+  # Rotas com JWT (Lambda Authorizer): o recurso e tudo abaixo dele.
+  rotas_protegidas = merge(
+    { for recurso, servico in local.recursos : "ANY ${recurso}" => servico },
+    { for recurso, servico in local.recursos : "ANY ${recurso}/{proxy+}" => servico },
+  )
+
+  # Rotas sem JWT, com throttling próprio no stage.
+  rotas_publicas = {
+    # Mercado Pago: a assinatura x-signature é validada no billing-service.
+    "POST /webhooks/mercadopago" = "billing"
+    # Login da equipe (usuário e senha). O dos clientes, por CPF, é o POST /auth da Lambda.
+    "POST /api/auth/login" = "os"
+  }
+
+  servicos = toset(values(merge(local.rotas_protegidas, local.rotas_publicas)))
+
+  # Sem valor explícito, a Lambda chama o os-service pelo listener dele no NLB interno.
+  os_service_port = coalesce(var.os_service_port, local.k8s.listener_ports["os"])
+  os_service_url  = coalesce(var.os_service_url, "http://${local.k8s.nlb_dns_name}:${local.os_service_port}")
 }
 
 # ───────────── Estado remoto dos demais repositórios de infra ─────────────
-# Repo 2 (infra-k8s): VPC, subnets privadas, SG dos nós e o NLB interno do app.
+# Repo 2 (infra-k8s): VPC, subnets privadas, SG dos nós e o NLB interno, com um listener
+# por serviço (listener_arns, listener_ports, nlb_dns_name).
 # A Lambda não depende mais do infra-database: o cliente vem do os-service, por HTTP.
 data "terraform_remote_state" "k8s" {
   backend = "s3"
@@ -70,8 +105,8 @@ resource "aws_security_group" "lambda" {
   # continua lá, porque também atende os nós do EKS.
   egress {
     description = "os-service pelo NLB interno"
-    from_port   = var.os_service_port
-    to_port     = var.os_service_port
+    from_port   = local.os_service_port
+    to_port     = local.os_service_port
     protocol    = "tcp"
     cidr_blocks = [data.terraform_remote_state.k8s.outputs.vpc_cidr]
   }
@@ -107,7 +142,7 @@ resource "aws_lambda_function" "auth" {
       JWT_ISSUER             = var.jwt_issuer
       JWT_AUDIENCE           = var.jwt_audience
       JWT_EXPIRES_MINUTES    = tostring(var.jwt_expires_minutes)
-      OS_SERVICE_URL         = var.os_service_url
+      OS_SERVICE_URL         = local.os_service_url
       OS_SERVICE_TIMEOUT_MS  = tostring(var.os_service_timeout_ms)
       INTERNAL_KEY_SECRET_ID = var.internal_key_secret_id
     }
@@ -144,6 +179,21 @@ resource "aws_apigatewayv2_stage" "this" {
   name        = "$default"
   auto_deploy = true
 
+  default_route_settings {
+    throttling_burst_limit = var.throttling_padrao.burst
+    throttling_rate_limit  = var.throttling_padrao.rate
+  }
+
+  # As rotas sem JWT ganham um limite menor: são as que qualquer um alcança.
+  dynamic "route_settings" {
+    for_each = local.rotas_publicas
+    content {
+      route_key              = route_settings.key
+      throttling_burst_limit = var.throttling_publico.burst
+      throttling_rate_limit  = var.throttling_publico.rate
+    }
+  }
+
   access_log_settings {
     destination_arn = aws_cloudwatch_log_group.apigw.arn
     format = jsonencode({
@@ -155,6 +205,9 @@ resource "aws_apigatewayv2_stage" "this" {
       correlationId = "$context.requestId"
     })
   }
+
+  # route_settings só aceita rotas que já existem.
+  depends_on = [aws_apigatewayv2_route.publica]
 }
 
 resource "aws_cloudwatch_log_group" "apigw" {
@@ -210,21 +263,35 @@ resource "aws_apigatewayv2_vpc_link" "eks" {
   security_group_ids = [data.terraform_remote_state.k8s.outputs.nodes_security_group_id]
 }
 
-resource "aws_apigatewayv2_integration" "app" {
+# Uma integração por serviço, cada uma no listener dele do NLB.
+resource "aws_apigatewayv2_integration" "servico" {
+  for_each = local.servicos
+
   api_id                 = aws_apigatewayv2_api.this.id
   integration_type       = "HTTP_PROXY"
   integration_method     = "ANY"
-  integration_uri        = data.terraform_remote_state.k8s.outputs.app_listener_arn
+  integration_uri        = local.k8s.listener_arns[each.key]
   connection_type        = "VPC_LINK"
   connection_id          = aws_apigatewayv2_vpc_link.eks.id
   payload_format_version = "1.0"
 }
 
 # Rotas protegidas: exigem JWT validado pelo Lambda Authorizer.
-resource "aws_apigatewayv2_route" "app" {
+resource "aws_apigatewayv2_route" "protegida" {
+  for_each = local.rotas_protegidas
+
   api_id             = aws_apigatewayv2_api.this.id
-  route_key          = "ANY /api/{proxy+}"
-  target             = "integrations/${aws_apigatewayv2_integration.app.id}"
+  route_key          = each.key
+  target             = "integrations/${aws_apigatewayv2_integration.servico[each.value].id}"
   authorization_type = "CUSTOM"
   authorizer_id      = aws_apigatewayv2_authorizer.jwt.id
+}
+
+resource "aws_apigatewayv2_route" "publica" {
+  for_each = local.rotas_publicas
+
+  api_id             = aws_apigatewayv2_api.this.id
+  route_key          = each.key
+  target             = "integrations/${aws_apigatewayv2_integration.servico[each.value].id}"
+  authorization_type = "NONE"
 }

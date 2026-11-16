@@ -24,6 +24,10 @@ jobs:
       - run: npm test
       - run: npm run build
 
-      - name: Terraform fmt & validate
+      - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
-      - run: terraform -chdir=terraform fmt -check
+      - run: terraform -chdir=terraform fmt -check -recursive
+      - run: terraform -chdir=terraform init -backend=false -input=false
+      - run: terraform -chdir=terraform validate
+      # Provider AWS mockado e o estado do infra-k8s simulado (terraform/tests).
+      - run: terraform -chdir=terraform test
