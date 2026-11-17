@@ -49,18 +49,19 @@ variable "lambda_zip_path" {
 # ─────────────── os-service (endpoint interno de clientes) ───────────────
 variable "os_service_url" {
   type        = string
-  description = "URL base do os-service na rede privada (NLB interno), ex.: http://<dns-do-nlb-interno>. A Lambda chama {url}/internal/clientes/por-cpf/{cpf}."
+  default     = null
+  description = "URL base do os-service na rede privada. Vazio: http://<nlb_dns_name>:<porta do os> do infra-k8s. A Lambda chama {url}/internal/clientes/por-cpf/{cpf}."
 
   validation {
-    condition     = can(regex("^https?://[^/]+", var.os_service_url))
+    condition     = var.os_service_url == null || var.os_service_url == "" || can(regex("^https?://[^/]+", var.os_service_url))
     error_message = "os_service_url deve começar com http:// ou https://."
   }
 }
 
 variable "os_service_port" {
   type        = number
-  default     = 80
-  description = "Porta do listener do NLB interno (a mesma de os_service_url). Libera a saída da Lambda só para ela, dentro da VPC."
+  default     = null
+  description = "Porta do listener do os-service no NLB. Vazio: listener_ports[\"os\"] do infra-k8s (8081). Libera a saída da Lambda só para ela, dentro da VPC."
 }
 
 variable "os_service_timeout_ms" {
@@ -72,4 +73,17 @@ variable "os_service_timeout_ms" {
 variable "internal_key_secret_id" {
   type        = string
   description = "Nome/ID do secret com a chave do header X-Internal-Key: {\"key\":\"...\"}. O os-service lê o mesmo valor em InternalApi__Key."
+}
+
+# ─────────────────────────── Throttling do API Gateway ───────────────────────────
+variable "throttling_padrao" {
+  type        = object({ burst = number, rate = number })
+  default     = { burst = 200, rate = 100 }
+  description = "Limite de todas as rotas (requisições por segundo e rajada)."
+}
+
+variable "throttling_publico" {
+  type        = object({ burst = number, rate = number })
+  default     = { burst = 20, rate = 10 }
+  description = "Limite das rotas sem JWT: webhook do Mercado Pago e login da equipe."
 }

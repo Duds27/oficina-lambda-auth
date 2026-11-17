@@ -52,6 +52,27 @@ A rota `/internal/*` do os-service **não** passa pelo API Gateway público. A L
 alcança pela rede privada da VPC, e o security group dela só libera a saída para o NLB
 interno (porta do os-service) e para HTTPS (Secrets Manager).
 
+## Rotas do API Gateway
+
+Desde a Fase 4, cada recurso vai para o listener do seu serviço no NLB interno (VPC Link). Os
+caminhos já são exclusivos de cada serviço, então o path segue como veio, sem reescrita.
+
+| Rotas (`ANY /x` e `ANY /x/{proxy+}`) | Serviço (listener) | Autorização |
+| --- | --- | --- |
+| `/api/clientes`, `/api/veiculos`, `/api/pecas`, `/api/servicos`, `/api/ordens-servico` | os-service (8081) | JWT (Lambda Authorizer) |
+| `/api/orcamentos`, `/api/pagamentos` | billing-service (8082) | JWT |
+| `/api/execucoes` | execution-service (8083) | JWT |
+| `POST /api/auth/login` | os-service | Nenhuma: login da equipe por usuário e senha |
+| `POST /webhooks/mercadopago` | billing-service | Nenhuma: a assinatura `x-signature` é validada no serviço |
+| `POST /auth` | Lambda auth | Nenhuma: login do cliente por CPF |
+
+- `/internal/*` e `/dev/*` não são roteados.
+- **Throttling:** 100 req/s com rajada de 200 em todas as rotas. As rotas sem JWT (webhook e
+  login da equipe) ficam em 10 req/s com rajada de 20 (`throttling_publico`).
+- O login da equipe não está na tabela do plano da Etapa 4. Entrou porque o token de Admin e
+  de Mecânico sai dele, e na Fase 3 a rota genérica `ANY /api/{proxy+}` exigia JWT até para ele.
+- A saída `webhook_mercadopago_url` é a `Pagamentos__MercadoPago__NotificationUrl` do billing-service.
+
 ## Contrato da API
 
 `POST /auth`
@@ -84,7 +105,7 @@ conferir que quem aprova um orçamento é o dono dele.
 | `JWT_SECRET_ID` | auth e authorizer | Secret com a chave do JWT: `{"key":"..."}` |
 | `JWT_ISSUER`, `JWT_AUDIENCE` | auth e authorizer | Padrão `OficinaMecanicaBackend` |
 | `JWT_EXPIRES_MINUTES` | auth | Validade do token (padrão 60) |
-| `OS_SERVICE_URL` | auth | URL base do os-service na rede privada, ex.: `http://<dns-do-nlb-interno>` |
+| `OS_SERVICE_URL` | auth | URL base do os-service na rede privada. O Terraform monta `http://<nlb_dns_name>:<porta do os>` a partir das saídas do `infra-k8s`, a menos que a variável `os_service_url` seja informada |
 | `INTERNAL_KEY_SECRET_ID` | auth | Secret com a chave do header `X-Internal-Key`: `{"key":"..."}`. Precisa ter o mesmo valor de `InternalApi__Key` no os-service. |
 | `OS_SERVICE_TIMEOUT_MS` | auth | Tempo máximo de espera pelo os-service (padrão 3000) |
 
@@ -109,10 +130,27 @@ build → `dist/lambda.zip` → `terraform apply`. Variáveis/segredos necessár
 | Tipo | Nome |
 | --- | --- |
 | Secret | `AWS_DEPLOY_ROLE_ARN`, `JWT_SECRET_ID` |
-| Variable | `AWS_REGION`, `TF_STATE_BUCKET`, `TF_LOCK_TABLE`, `OS_SERVICE_URL`, `INTERNAL_KEY_SECRET_ID` |
+| Variable | `AWS_REGION`, `TF_STATE_BUCKET`, `TF_LOCK_TABLE`, `INTERNAL_KEY_SECRET_ID` e, opcional, `OS_SERVICE_URL` |
 
-O Terraform consome os outputs do `infra-k8s` (VPC, CIDR, subnets e NLB) via
-`terraform_remote_state`. Não depende mais do `infra-database`.
+O Terraform consome os outputs do `infra-k8s` via `terraform_remote_state`: VPC, CIDR,
+subnets, DNS do NLB e os listeners por serviço (`listener_arns`, `listener_ports`). Não depende
+mais do `infra-database`. Aplique depois do `infra-k8s`.
+
+### Testes do Terraform
+
+```bash
+terraform -chdir=terraform init -backend=false
+terraform -chdir=terraform test
+```
+
+`terraform/tests/api.tftest.hcl` roda sem conta AWS (provider mockado, estado do `infra-k8s`
+simulado). Os casos:
+
+- cada recurso vai para o listener do seu serviço;
+- as rotas `/api/*` exigem JWT;
+- webhook e login da equipe são públicos e têm throttling;
+- `/internal` e `/dev` ficam de fora;
+- a URL do os-service é montada a partir do NLB, e a explícita prevalece.
 
 ## Deploy ativo
 
