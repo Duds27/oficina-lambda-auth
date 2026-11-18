@@ -33,10 +33,15 @@ jobs:
         run: |
           cd dist && zip -r ../dist/lambda.zip handler.js authorizer.js *.map
 
-      - name: Configurar credenciais AWS (OIDC)
+      # OIDC (secret AWS_DEPLOY_ROLE_ARN) ou chave de acesso de um usuário IAM (secrets
+      # AWS_ACCESS_KEY_ID e AWS_SECRET_ACCESS_KEY), para contas em que a organização
+      # bloqueia o provider OIDC do IAM. Cadastre só um dos dois.
+      - name: Configurar credenciais AWS
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ vars.AWS_REGION }}
 
       - uses: hashicorp/setup-terraform@v3
