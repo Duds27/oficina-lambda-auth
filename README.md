@@ -129,8 +129,8 @@ build → `dist/lambda.zip` → `terraform apply`. Variáveis/segredos necessár
 
 | Tipo | Nome |
 | --- | --- |
-| Secret | `AWS_DEPLOY_ROLE_ARN`, `JWT_SECRET_ID` |
-| Variable | `AWS_REGION`, `TF_STATE_BUCKET`, `TF_LOCK_TABLE`, `INTERNAL_KEY_SECRET_ID` e, opcional, `OS_SERVICE_URL` |
+| Secret | `JWT_SECRET_ID` e a credencial da AWS: `AWS_ACCESS_KEY_ID` com `AWS_SECRET_ACCESS_KEY` (conta sem OIDC, veja o [README do infra-k8s](https://github.com/Duds27/oficina-infra-k8s#conta-aws)) ou `AWS_DEPLOY_ROLE_ARN` |
+| Variable | `AWS_REGION` (`us-east-2`), `TF_STATE_BUCKET`, `TF_LOCK_TABLE`, `INTERNAL_KEY_SECRET_ID` e, opcional, `OS_SERVICE_URL` |
 
 O Terraform consome os outputs do `infra-k8s` via `terraform_remote_state`: VPC, CIDR,
 subnets, DNS do NLB e os listeners por serviço (`listener_arns`, `listener_ports`). Não depende

@@ -1,7 +1,7 @@
 variable "aws_region" {
   type        = string
-  default     = "us-east-1"
-  description = "Região AWS."
+  default     = "us-east-2"
+  description = "Região AWS. A conta do grupo só libera a us-east-2 (SCP da organização)."
 }
 
 variable "project" {
